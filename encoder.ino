@@ -18,7 +18,7 @@ int leftIR = A3; // 0 = black
 
 // --- Distance Tracking Variables ---
 float distanceTraveled = 0.0;
-const float wheelDiameter = 0.065;
+const float wheelDiameter = 0.045;
 const int pulsesPerRevolution = 20;
 float distancePerPulse;
 volatile long encoderPulses = 0;
