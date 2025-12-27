@@ -13,9 +13,9 @@ int in3 = 3;    // Left wheel direction 1
 int in4 = 2;    // Left wheel direction 2
 
 // --- IR Sensors ---
-int midIR = A1;  // 0 = black
-int homeIR = A2; // 1 = black
-int leftIR = A3; // 0 = black
+int midIR = A1;  // 1 = black
+int homeIR = A2; // 0 = black
+int leftIR = A3; // 1 = black
 
 // --- Distance Tracking Variables ---
 unsigned long distanceTimer = 0;  // Timer for distance updates
