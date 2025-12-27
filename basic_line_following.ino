@@ -67,9 +67,9 @@ void stopAll() {
 
 void loop() {
 
-  int midVal = digitalRead(midIR);   // 0 = black
-  int homeVal = digitalRead(homeIR); // 1 = black
-  int leftVal = digitalRead(leftIR); // 0 = black
+  int midVal = digitalRead(midIR);   // 1 = black
+  int homeVal = digitalRead(homeIR); // 0 = black
+  int leftVal = digitalRead(leftIR); // 1 = black
 
   
   // ----------- BEHAVIOR LOGIC ----------------
