@@ -1,0 +1,107 @@
+"""
+symbol_detection_only.py
+Standalone ONNX symbol detection using PiCamera2
+code by: @lanno & oscar
+"""
+
+import cv2
+import numpy as np
+import time
+import os
+
+from picamera2 import Picamera2
+import onnxruntime as ort
+
+# ═══════════════════════════════════════
+# CONFIG
+# ═══════════════════════════════════════
+
+CAMERA_RESOLUTION = (640, 480)
+ONNX_MODEL_PATH = "model.onnx"
+LABELS_PATH = "labels.txt"
+INPUT_SIZE = 224
+
+# ═══════════════════════════════════════
+# LOAD MODEL + LABELS
+# ═══════════════════════════════════════
+
+if not os.path.exists(LABELS_PATH):
+    print("labels.txt not found")
+    exit()
+
+with open(LABELS_PATH) as f:
+    labels = [l.strip().split(None, 1)[-1] for l in f if l.strip()]
+
+if not os.path.exists(ONNX_MODEL_PATH):
+    print("model.onnx not found")
+    exit()
+
+session = ort.InferenceSession(ONNX_MODEL_PATH, providers=["CPUExecutionProvider"])
+input_name = session.get_inputs()[0].name
+
+print("Model loaded successfully")
+
+# ═══════════════════════════════════════
+# CAMERA SETUP
+# ═══════════════════════════════════════
+
+picam2 = Picamera2()
+picam2.configure(picam2.create_video_configuration(
+    main={"size": CAMERA_RESOLUTION, "format": "BGR888"}
+))
+picam2.start()
+time.sleep(1)
+
+# ═══════════════════════════════════════
+# INFERENCE FUNCTION
+# ═══════════════════════════════════════
+
+def classify(frame_bgr):
+    resized = cv2.resize(frame_bgr, (INPUT_SIZE, INPUT_SIZE))
+    gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+
+    # convert to 3 channel
+    rgb = cv2.merge([gray, gray, gray])
+
+    # normalize
+    img = (rgb.astype(np.float32) / 255.0 - 0.449) / 0.226
+
+    # HWC → CHW
+    blob = np.transpose(img, (2, 0, 1))[np.newaxis, ...]
+
+    try:
+        scores = session.run(None, {input_name: blob})[0][0]
+
+        # softmax
+        e = np.exp(scores - np.max(scores))
+        probs = e / e.sum()
+
+        idx = int(np.argmax(probs))
+        return labels[idx], float(probs[idx] * 100)
+
+    except Exception as e:
+        print("Inference error:", e)
+        return "error", 0.0
+
+# ═══════════════════════════════════════
+# MAIN LOOP
+# ═══════════════════════════════════════
+
+while True:
+    frame = picam2.capture_array()
+
+    label, conf = classify(frame)
+
+    # display result
+    text = f"{label}: {conf:.1f}%"
+    cv2.putText(frame, text, (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 1,
+                (0, 255, 0), 2)
+
+    cv2.imshow("Symbol Detection", frame)
+
+    if cv2.waitKey(1) & 0xFF == 27:  # ESC to quit
+        break
+
+picam2.stop()
+cv2.destroyAllWindows()
