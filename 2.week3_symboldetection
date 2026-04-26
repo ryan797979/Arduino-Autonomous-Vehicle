@@ -1,107 +1,298 @@
 """
-symbol_detection_only.py
-Standalone ONNX symbol detection using PiCamera2
-code by: @lanno & oscar
+symbol_detection.py
+H61 AEE — Integrated Autonomous Delivery Robot
+Extracted symbol detection module from finale.py
+
+Includes:
+- ONNX model loading and inference pipeline
+- Per-symbol confidence thresholds
+- Stable frame confirmation buffer
+- Action cooldown system
+- FSM action execution (arrow turns, recycle spin, stop, log-only)
+- Shared state management for symbol detection thread
 """
 
-import cv2
-import numpy as np
-import time
-import os
+import time, threading, os
+import cv2, numpy as np
 
-from picamera2 import Picamera2
-import onnxruntime as ort
+try:
+    import onnxruntime as ort
+except ImportError:
+    print("error: pip install onnxruntime --break-system-packages")
 
-# ═══════════════════════════════════════
-# CONFIG
-# ═══════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+#  AI Model Parameters
+# ═══════════════════════════════════════════════════════════════
 
-CAMERA_RESOLUTION = (640, 480)
-ONNX_MODEL_PATH = "model.onnx"
-LABELS_PATH = "labels.txt"
-INPUT_SIZE = 224
+ONNX_MODEL_PATH    = "model.onnx"
+TFLITE_LABELS_PATH = "labels.txt"
+ONNX_INPUT_SIZE    = 224
 
-# ═══════════════════════════════════════
-# LOAD MODEL + LABELS
-# ═══════════════════════════════════════
+# Per-symbol confidence thresholds — how high to consider it detected
+CONF_THRESHOLDS = {
+    "arrowleft":   30.0,
+    "arrowright":  30.0,
+    "arrowup":     60.0,
+    "warningsign": 80.0,
+    "qrcode":      60.0,
+    "thumb":       60.0,
+    "recyclesign": 80.0,
+    "buttonsign":  60.0,
+}
+CONF_THRESHOLD_DEFAULT = 50.0  # fallback for unlisted labels
 
-if not os.path.exists(LABELS_PATH):
-    print("labels.txt not found")
-    exit()
+ACTION_COOLDOWN_SEC = 7.0
 
-with open(LABELS_PATH) as f:
-    labels = [l.strip().split(None, 1)[-1] for l in f if l.strip()]
+# Motor speed constants (referenced by FSM actions)
+BASE_SPEED  = 20
+SPIN_SPEED  = 42
+BINARY_THRESHOLD   = 80
+LINE_LOST_THRESHOLD = 100
 
-if not os.path.exists(ONNX_MODEL_PATH):
-    print("model.onnx not found")
-    exit()
+# ═══════════════════════════════════════════════════════════════
+#  ONNX Model Loading
+# ═══════════════════════════════════════════════════════════════
 
-session = ort.InferenceSession(ONNX_MODEL_PATH, providers=["CPUExecutionProvider"])
-input_name = session.get_inputs()[0].name
+_session    = None
+_input_name = None
+_labels     = []
 
-print("Model loaded successfully")
-
-# ═══════════════════════════════════════
-# CAMERA SETUP
-# ═══════════════════════════════════════
-
-picam2 = Picamera2()
-picam2.configure(picam2.create_video_configuration(
-    main={"size": CAMERA_RESOLUTION, "format": "BGR888"}
-))
-picam2.start()
-time.sleep(1)
-
-# ═══════════════════════════════════════
-# INFERENCE FUNCTION
-# ═══════════════════════════════════════
-
-def classify(frame_bgr):
-    resized = cv2.resize(frame_bgr, (INPUT_SIZE, INPUT_SIZE))
-    gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-
-    # convert to 3 channel
-    rgb = cv2.merge([gray, gray, gray])
-
-    # normalize
-    img = (rgb.astype(np.float32) / 255.0 - 0.449) / 0.226
-
-    # HWC → CHW
-    blob = np.transpose(img, (2, 0, 1))[np.newaxis, ...]
-
+def _load_onnx():
+    global _session, _labels, _input_name
+    if not os.path.exists(TFLITE_LABELS_PATH):
+        return False
+    with open(TFLITE_LABELS_PATH) as f:
+        _labels = [l.strip().split(None, 1)[-1] for l in f if l.strip()]
+    if not os.path.exists(ONNX_MODEL_PATH):
+        return False
     try:
-        scores = session.run(None, {input_name: blob})[0][0]
-
-        # softmax
-        e = np.exp(scores - np.max(scores))
-        probs = e / e.sum()
-
-        idx = int(np.argmax(probs))
-        return labels[idx], float(probs[idx] * 100)
-
+        _session    = ort.InferenceSession(ONNX_MODEL_PATH,
+                          providers=["CPUExecutionProvider"])
+        _input_name = _session.get_inputs()[0].name
+        return True
     except Exception as e:
-        print("Inference error:", e)
+        print(f"Model Load Failed: {e}")
+        return False
+
+# ═══════════════════════════════════════════════════════════════
+#  ONNX Inference Pipeline
+#  BGR > resize to 224x224 > grayscale > 3-channel RGB >
+#  float32 normalise > NCHW blob > run model > softmax > argmax
+# ═══════════════════════════════════════════════════════════════
+
+def _onnx_classify(frame_bgr):
+    resized = cv2.resize(frame_bgr, (ONNX_INPUT_SIZE, ONNX_INPUT_SIZE))
+    gray    = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+    rgb     = cv2.merge([gray, gray, gray])               # 3-channel grayscale
+    img_f   = (rgb.astype(np.float32) / 255.0 - 0.449) / 0.226  # normalise
+    blob    = np.transpose(img_f, (2, 0, 1))[np.newaxis, ...]    # NCHW format
+    try:
+        scores = _session.run(None, {_input_name: blob})[0][0].astype(np.float32)
+        e_     = np.exp(scores - scores.max())   # softmax numerically stable
+        probs  = e_ / e_.sum()
+        idx    = int(np.argmax(probs))
+        return _labels[idx], float(probs[idx] * 100)
+    except:
         return "error", 0.0
 
-# ═══════════════════════════════════════
-# MAIN LOOP
-# ═══════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+#  Shared Symbol State
+# ═══════════════════════════════════════════════════════════════
 
-while True:
-    frame = picam2.capture_array()
+symbol_lock  = threading.Lock()
+symbol_state = {
+    "shape":      "—",
+    "confidence": 0.0,
+    "action":     "none",
+    "flash":      False
+}
 
-    label, conf = classify(frame)
+action_lock  = threading.Lock()
+action_state = {
+    "running":        False,
+    "permanent_stop": False
+}
 
-    # display result
-    text = f"{label}: {conf:.1f}%"
-    cv2.putText(frame, text, (20, 40),
-                cv2.FONT_HERSHEY_SIMPLEX, 1,
-                (0, 255, 0), 2)
+_action_cooldown = {}
 
-    cv2.imshow("Symbol Detection", frame)
+# ═══════════════════════════════════════════════════════════════
+#  Cooldown Helpers
+# ═══════════════════════════════════════════════════════════════
 
-    if cv2.waitKey(1) & 0xFF == 27:  # ESC to quit
-        break
+def _set_action(desc):
+    with symbol_lock:
+        symbol_state["action"] = desc
 
-picam2.stop()
-cv2.destroyAllWindows()
+def _is_in_cooldown(label):
+    return (time.time() - _action_cooldown.get(label.lower(), 0)) < ACTION_COOLDOWN_SEC
+
+def _mark_cooldown(label):
+    _action_cooldown[label.lower()] = time.time()
+
+# ═══════════════════════════════════════════════════════════════
+#  FSM Action Execution
+#  Runs in a daemon thread so it does not block the line-follow loop
+# ═══════════════════════════════════════════════════════════════
+
+def execute_action(label, set_motors, stop_motors, frame_lock, latest_cam_frame_ref):
+    """
+    Execute the FSM motor action for a confirmed symbol detection.
+
+    Parameters
+    ----------
+    label               : str   — detected symbol class name
+    set_motors          : func  — set_motors(left, right) from motor module
+    stop_motors         : func  — stop_motors() from motor module
+    frame_lock          : Lock  — shared frame buffer lock
+    latest_cam_frame_ref: list  — single-element list holding latest_cam_frame
+                                  (mutable reference so the thread sees updates)
+    """
+    key = label.lower()
+
+    # ── 1. Thumb / QR code — flash on dashboard only, no motor action ──────
+    if key in ("thumb", "qrcode"):
+        _set_action(f"flash_{key}")
+        with symbol_lock:
+            symbol_state["flash"] = True
+        time.sleep(2.5)
+        with symbol_lock:
+            symbol_state["flash"] = False
+        _set_action("none")
+        _mark_cooldown(label)
+        return
+
+    # ── 2. Button / Warning — permanent stop ────────────────────────────────
+    if key in ("buttonsign", "warningsign"):
+        with action_lock:
+            action_state["permanent_stop"] = True
+            action_state["running"]        = False
+        _set_action(f"{label} — STOPPED")
+        stop_motors()
+        print(f"[ACTION] Permanent stop triggered by {label}")
+        return
+
+    # ── 3. Arrow / Recycle — timed motor actions ────────────────────────────
+    with action_lock:
+        if not action_state["running"]:
+            action_state["running"] = True
+
+    try:
+        stop_motors()
+
+        # Arrow Up — drive forward 1.2 s then resume line following
+        if key == "arrowup":
+            _set_action("ArrowUp — Straight")
+            set_motors(BASE_SPEED, BASE_SPEED)
+            time.sleep(1.2)
+
+        # Arrow Left / Right — forward, pivot, then search for line
+        elif key in ("arrowleft", "arrowright"):
+            direction = "left" if key == "arrowleft" else "right"
+            _set_action(f"Arrow{direction.capitalize()} — Searching line...")
+
+            # Step 1: drive forward briefly before rotating
+            stop_motors()
+            set_motors(BASE_SPEED, BASE_SPEED)
+            time.sleep(0.8)
+
+            # Step 2: begin pivot toward intended direction
+            spin_l = -SPIN_SPEED if direction == "left" else  SPIN_SPEED
+            spin_r =  SPIN_SPEED if direction == "left" else -SPIN_SPEED
+            set_motors(spin_l, spin_r)
+            time.sleep(0.5)
+
+            # Step 3: continue spinning until line is reacquired (closed-loop search)
+            LINE_CONFIRM_FRAMES = 3
+            MAX_SEARCH_TIME     = 3.0
+            found_count = 0
+            t0 = time.time()
+
+            while time.time() - t0 < MAX_SEARCH_TIME:
+                set_motors(spin_l, spin_r)
+                time.sleep(0.03)
+                with frame_lock:
+                    f = latest_cam_frame_ref[0]
+                if f is not None:
+                    gray      = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+                    _, binary = cv2.threshold(gray, BINARY_THRESHOLD, 255,
+                                              cv2.THRESH_BINARY_INV)
+                    kernel    = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+                    binary    = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+                    moments   = cv2.moments(binary)
+                    if moments["m00"] > LINE_LOST_THRESHOLD:
+                        found_count += 1
+                        if found_count >= LINE_CONFIRM_FRAMES:
+                            break
+                    else:
+                        found_count = 0
+
+            stop_motors()
+            _set_action(f"Arrow{direction.capitalize()} — Done")
+
+        # Recycle sign — full 360-degree spin
+        elif key == "recyclesign":
+            _set_action("Recycle — Spin 360")
+            time.sleep(0.1)
+            stop_motors()
+            GROUND_SPIN_SPEED = int(SPIN_SPEED * 1.1)   # ~46 duty cycle
+            set_motors(GROUND_SPIN_SPEED, -GROUND_SPIN_SPEED)
+            time.sleep(2.8)
+
+    finally:
+        with action_lock:
+            action_state["running"] = False
+        _set_action("none")
+        _mark_cooldown(label)
+
+# ═══════════════════════════════════════════════════════════════
+#  Inference Loop
+#  Runs on Core 3. Reads latest_cam_frame, runs ONNX classify,
+#  updates symbol_state, spawns execute_action thread when
+#  confidence threshold met and cooldown has elapsed.
+# ═══════════════════════════════════════════════════════════════
+
+def inference_loop(frame_lock, latest_cam_frame_ref, set_motors, stop_motors):
+    """
+    Continuously classify frames and trigger FSM actions on confirmed detections.
+
+    Parameters
+    ----------
+    frame_lock              : Lock — shared frame buffer lock
+    latest_cam_frame_ref    : list — [latest_cam_frame] mutable reference
+    set_motors / stop_motors: funcs from motor module
+    """
+    while True:
+        with frame_lock:
+            f = latest_cam_frame_ref[0]
+
+        if f is None or _session is None:
+            time.sleep(0.05)
+            continue
+
+        label, conf = _onnx_classify(f)
+
+        with symbol_lock:
+            symbol_state.update({"shape": label, "confidence": conf})
+
+        threshold = CONF_THRESHOLDS.get(label.lower(), CONF_THRESHOLD_DEFAULT)
+
+        if conf >= threshold:
+            spawned = False
+            with action_lock:
+                busy = action_state["running"] or action_state["permanent_stop"]
+                if not busy and not _is_in_cooldown(label):
+                    # permanent-stop symbols don't set running=True
+                    if label.lower() not in ("thumb", "qrcode",
+                                             "buttonsign", "warningsign"):
+                        action_state["running"] = True
+                    spawned = True
+
+            if spawned:
+                threading.Thread(
+                    target=execute_action,
+                    args=(label, set_motors, stop_motors,
+                          frame_lock, latest_cam_frame_ref),
+                    daemon=True
+                ).start()
+
+        time.sleep(0.1)   # ~10 Hz inference rate
