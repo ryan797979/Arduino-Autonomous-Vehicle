@@ -1,0 +1,609 @@
+"""
+finale_combined.py
+H61 AEE — Integrated Autonomous Delivery Robot
+Group E23
+
+System architecture:
+  - Line following: original Week 2 PD controller with pivot mode
+  - Symbol detection: ONNX inference pipeline (referenced from public repository)
+  - Flask web dashboard: live monitoring over Wi-Fi
+
+Threading (RPi4 four cores):
+  Core 0 — Flask web server
+  Core 1 — processing_loop: line following + motor control
+  Core 2 — capture_loop: picamera2 frame acquisition
+  Core 3 — inference_loop: ONNX symbol classification
+"""
+
+import time, sys, threading, os, ctypes
+from flask import Flask, Response, jsonify
+import cv2, numpy as np
+
+try:
+    from picamera2 import Picamera2
+except ImportError:
+    print("error: sudo apt install python3-picamera2"); sys.exit(1)
+
+try:
+    import RPi.GPIO as GPIO
+except ImportError:
+    print("error: sudo apt install python3-rpi.gpio"); sys.exit(1)
+
+try:
+    import onnxruntime as ort
+except ImportError:
+    print("error: pip install onnxruntime --break-system-packages"); sys.exit(1)
+
+# ═══════════════════════════════════════════════════════════════
+#  Hardware Configuration
+# ═══════════════════════════════════════════════════════════════
+
+# GPIO pin assignments — L298N motor driver
+PIN_IN1, PIN_IN2 = 17, 27   # left motor direction
+PIN_IN3, PIN_IN4 = 22, 23   # right motor direction (physically inverted)
+PIN_ENA          = 18        # left motor PWM speed
+PIN_ENB          = 13        # right motor PWM speed
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+for pin in [PIN_IN1, PIN_IN2, PIN_IN3, PIN_IN4, PIN_ENA, PIN_ENB]:
+    GPIO.setup(pin, GPIO.OUT)
+
+# 500 Hz PWM for smoother motor control
+pwm_a = GPIO.PWM(PIN_ENA, 500); pwm_a.start(0)
+pwm_b = GPIO.PWM(PIN_ENB, 500); pwm_b.start(0)
+
+def set_motors(left, right):
+    """
+    Set left and right motor speeds.
+    Values in range -100 to 100 (percentage duty cycle).
+    Positive = forward, negative = reverse.
+    Note: right motor IN3/IN4 logic is inverted due to reversed physical mounting.
+    """
+    left  = max(-100.0, min(100.0, left))
+    right = max(-100.0, min(100.0, right))
+    GPIO.output(PIN_IN1, GPIO.HIGH if left  > 0 else GPIO.LOW)
+    GPIO.output(PIN_IN2, GPIO.LOW  if left  > 0 else (GPIO.HIGH if left  < 0 else GPIO.LOW))
+    GPIO.output(PIN_IN3, GPIO.LOW  if right > 0 else (GPIO.HIGH if right < 0 else GPIO.LOW))
+    GPIO.output(PIN_IN4, GPIO.HIGH if right > 0 else GPIO.LOW)
+    pwm_a.ChangeDutyCycle(abs(left))
+    pwm_b.ChangeDutyCycle(abs(right))
+
+def stop_motors():
+    set_motors(0, 0)
+
+# ═══════════════════════════════════════════════════════════════
+#  Camera Configuration
+# ═══════════════════════════════════════════════════════════════
+
+FRAME_WIDTH  = 640
+FRAME_HEIGHT = 480
+
+picam2 = Picamera2()
+picam2.configure(picam2.create_video_configuration(
+    main={"size": (FRAME_WIDTH, FRAME_HEIGHT), "format": "BGR888"},
+    controls={"FrameDurationLimits": (33333, 33333)}   # 30 fps
+))
+picam2.start()
+time.sleep(1)
+
+# ═══════════════════════════════════════════════════════════════
+#  Line Following Parameters (Week 2 PD controller)
+# ═══════════════════════════════════════════════════════════════
+
+KP                   = 0.9
+KD                   = 0.4
+BASE_SPEED           = 75      # % duty cycle (equivalent to 0.75 in gpiozero scale)
+PIVOT_POWER          = 100     # % duty cycle — full power pivot for sharp turns
+TARGET_CENTER        = FRAME_WIDTH // 2   # 320px
+
+SHARP_TURN_THRESHOLD = 25      # pixels — error above this triggers pivot mode
+MIN_LINE_AREA        = 200     # minimum moment area to consider line detected
+
+# ROI: bottom 55% of frame for line detection
+LINE_ROI_Y = int(FRAME_HEIGHT * 0.45)   # rows LINE_ROI_Y to FRAME_HEIGHT
+
+# Black line HSV thresholds
+LOWER_BLACK = np.array([0,   0,   0])
+UPPER_BLACK = np.array([180, 255, 75])
+
+# Colour line HSV thresholds (high saturation, excludes black and white)
+LOWER_COLOR = np.array([0,   250, 76])
+UPPER_COLOR = np.array([180, 255, 199])
+COLOR_AREA_THRESHOLD = 200     # minimum pixels to accept colour line
+
+last_error = 0
+
+def get_line_centroid(frame_bgr):
+    """
+    Detect line centroid from frame.
+    Priority: colour line > black line.
+    Returns (cx, line_type, mask)
+    """
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+
+    # Colour line mask — high saturation coloured segments
+    color_mask = cv2.inRange(hsv, LOWER_COLOR, UPPER_COLOR)
+    color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN,
+                                  np.ones((2, 2), np.uint8), iterations=1)
+    color_roi  = color_mask[LINE_ROI_Y:, :]
+    M_color    = cv2.moments(color_roi)
+
+    if M_color['m00'] > COLOR_AREA_THRESHOLD:
+        cx = int(M_color['m10'] / M_color['m00'])
+        return cx, 'color', color_mask
+
+    # Black line mask — fallback
+    black_mask = cv2.inRange(hsv, LOWER_BLACK, UPPER_BLACK)
+    black_roi  = black_mask[LINE_ROI_Y:, :]
+    M_black    = cv2.moments(black_roi)
+
+    if M_black['m00'] > MIN_LINE_AREA:
+        cx = int(M_black['m10'] / M_black['m00'])
+        return cx, 'black', black_mask
+
+    return None, 'none', black_mask
+
+def compute_steering(cx):
+    """
+    Compute left/right motor speeds using PD controller.
+    If error exceeds SHARP_TURN_THRESHOLD, override with full pivot.
+    """
+    global last_error
+    error      = cx - TARGET_CENTER
+    derivative = error - last_error
+    last_error = error
+
+    if abs(error) > SHARP_TURN_THRESHOLD:
+        # Pivot mode — bypass PID for sharp corners
+        if error > 0:
+            return (-PIVOT_POWER, PIVOT_POWER)   # line is to the right, pivot right
+        else:
+            return (PIVOT_POWER, -PIVOT_POWER)   # line is to the left, pivot left
+
+    # Normal PD control
+    correction  = (KP * error + KD * derivative) / 110.0
+    left_speed  = BASE_SPEED - correction * BASE_SPEED
+    right_speed = BASE_SPEED + correction * BASE_SPEED
+    left_speed  = max(min(left_speed,  100), -100)
+    right_speed = max(min(right_speed, 100), -100)
+    return (left_speed, right_speed)
+
+# ═══════════════════════════════════════════════════════════════
+#  ONNX Symbol Detection Parameters
+# ═══════════════════════════════════════════════════════════════
+
+ONNX_MODEL_PATH    = "model.onnx"
+TFLITE_LABELS_PATH = "labels.txt"
+ONNX_INPUT_SIZE    = 224
+
+# Per-symbol confidence thresholds
+CONF_THRESHOLDS = {
+    "arrowleft":   30.0,
+    "arrowright":  30.0,
+    "arrowup":     60.0,
+    "warningsign": 80.0,
+    "qrcode":      60.0,
+    "thumb":       60.0,
+    "recyclesign": 80.0,
+    "buttonsign":  60.0,
+}
+CONF_THRESHOLD_DEFAULT = 50.0
+
+STABLE_NEEDED      = 6     # consecutive detections before triggering action
+ACTION_COOLDOWN_SEC = 7.0
+
+# FSM action durations
+STOP_DURATION        = 5.0
+TURN_90_DURATION     = 0.7    # from angle calibration: 90deg right ~ 0.7s
+TURN_90_LEFT_DURATION = 0.85  # 90deg left ~ 0.85s (asymmetric motor rates)
+TURN_180_DURATION    = 2.8    # recycle 360 spin
+
+_session    = None
+_input_name = None
+_labels     = []
+
+def _load_onnx():
+    global _session, _labels, _input_name
+    if not os.path.exists(TFLITE_LABELS_PATH): return False
+    with open(TFLITE_LABELS_PATH) as f:
+        _labels = [l.strip().split(None, 1)[-1] for l in f if l.strip()]
+    if not os.path.exists(ONNX_MODEL_PATH): return False
+    try:
+        _session    = ort.InferenceSession(ONNX_MODEL_PATH,
+                          providers=["CPUExecutionProvider"])
+        _input_name = _session.get_inputs()[0].name
+        return True
+    except Exception as e:
+        print(f"Model load failed: {e}"); return False
+
+def _onnx_classify(frame_bgr):
+    """
+    Preprocess frame and run ONNX inference.
+    BGR > resize 224x224 > grayscale > 3ch > normalise > NCHW > softmax > argmax
+    Normalisation constants (mean=0.449, std=0.226) match Teachable Machine export spec.
+    """
+    resized = cv2.resize(frame_bgr, (ONNX_INPUT_SIZE, ONNX_INPUT_SIZE))
+    gray    = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+    rgb     = cv2.merge([gray, gray, gray])
+    img_f   = (rgb.astype(np.float32) / 255.0 - 0.449) / 0.226
+    blob    = np.transpose(img_f, (2, 0, 1))[np.newaxis, ...]
+    try:
+        scores = _session.run(None, {_input_name: blob})[0][0].astype(np.float32)
+        e_     = np.exp(scores - scores.max())
+        probs  = e_ / e_.sum()
+        idx    = int(np.argmax(probs))
+        return _labels[idx], float(probs[idx] * 100)
+    except:
+        return "error", 0.0
+
+# ═══════════════════════════════════════════════════════════════
+#  Shared State
+# ═══════════════════════════════════════════════════════════════
+
+frame_lock       = threading.Lock()
+latest_cam_frame = None
+latest_disp_frame = None
+
+state_lock  = threading.Lock()
+robot_state = {
+    "status": "init", "direction": "straight",
+    "error_px": 0, "left_speed": 0.0, "right_speed": 0.0,
+    "fps": 0.0, "line_type": "none"
+}
+
+symbol_lock  = threading.Lock()
+symbol_state = {
+    "shape": "—", "confidence": 0.0,
+    "action": "none", "flash": False
+}
+
+action_lock  = threading.Lock()
+action_state = {"running": False, "permanent_stop": False}
+
+stable_counts    = {}
+_action_cooldown = {}
+
+# ═══════════════════════════════════════════════════════════════
+#  FSM Action Execution
+# ═══════════════════════════════════════════════════════════════
+
+def _set_action(desc):
+    with symbol_lock: symbol_state["action"] = desc
+
+def _is_in_cooldown(label):
+    return (time.time() - _action_cooldown.get(label.lower(), 0)) < ACTION_COOLDOWN_SEC
+
+def _mark_cooldown(label):
+    _action_cooldown[label.lower()] = time.time()
+
+def execute_action(label):
+    key = label.lower()
+
+    # Thumb / QR — flash on dashboard, no motor action
+    if key in ("thumb", "qrcode"):
+        _set_action(f"flash_{key}")
+        with symbol_lock: symbol_state["flash"] = True
+        time.sleep(2.5)
+        with symbol_lock: symbol_state["flash"] = False
+        _set_action("none")
+        _mark_cooldown(label)
+        return
+
+    # Warning / Button — permanent stop
+    if key in ("buttonsign", "warningsign"):
+        with action_lock:
+            action_state["permanent_stop"] = True
+            action_state["running"]        = False
+        _set_action(f"{label} — STOPPED")
+        stop_motors()
+        print(f"[ACTION] Permanent stop: {label}")
+        return
+
+    # Arrow / Recycle — timed motor actions
+    with action_lock:
+        if not action_state["running"]:
+            action_state["running"] = True
+
+    try:
+        stop_motors()
+
+        if key == "arrowup":
+            _set_action("ArrowUp — Forward")
+            set_motors(BASE_SPEED, BASE_SPEED)
+            time.sleep(1.2)
+
+        elif key in ("arrowleft", "arrowright"):
+            direction = "left" if key == "arrowleft" else "right"
+            _set_action(f"Arrow{direction.capitalize()} — Turning")
+
+            # Step 1: brief forward movement before rotating
+            set_motors(BASE_SPEED, BASE_SPEED)
+            time.sleep(0.8)
+            stop_motors()
+
+            # Step 2: pivot using calibrated turn duration
+            if direction == "left":
+                set_motors(-PIVOT_POWER, PIVOT_POWER)
+                time.sleep(TURN_90_LEFT_DURATION)
+            else:
+                set_motors(PIVOT_POWER, -PIVOT_POWER)
+                time.sleep(TURN_90_DURATION)
+            stop_motors()
+
+            # Step 3: search for line after turn (closed-loop)
+            LINE_CONFIRM_FRAMES = 3
+            MAX_SEARCH_TIME     = 3.0
+            spin_l = -PIVOT_POWER if direction == "left" else  PIVOT_POWER
+            spin_r =  PIVOT_POWER if direction == "left" else -PIVOT_POWER
+            found_count = 0
+            t0 = time.time()
+
+            while time.time() - t0 < MAX_SEARCH_TIME:
+                set_motors(spin_l, spin_r)
+                time.sleep(0.03)
+                with frame_lock:
+                    f = latest_cam_frame
+                if f is not None:
+                    hsv = cv2.cvtColor(f, cv2.COLOR_BGR2HSV)
+                    mask = cv2.inRange(hsv, LOWER_BLACK, UPPER_BLACK)
+                    roi  = mask[LINE_ROI_Y:, :]
+                    M    = cv2.moments(roi)
+                    if M['m00'] > MIN_LINE_AREA:
+                        found_count += 1
+                        if found_count >= LINE_CONFIRM_FRAMES:
+                            break
+                    else:
+                        found_count = 0
+
+            stop_motors()
+            _set_action(f"Arrow{direction.capitalize()} — Done")
+
+        elif key == "recyclesign":
+            _set_action("Recycle — Spin 360")
+            stop_motors()
+            time.sleep(0.1)
+            set_motors(PIVOT_POWER, -PIVOT_POWER)
+            time.sleep(TURN_180_DURATION)
+
+    finally:
+        with action_lock: action_state["running"] = False
+        _set_action("none")
+        _mark_cooldown(label)
+
+# ═══════════════════════════════════════════════════════════════
+#  Thread Loops
+# ═══════════════════════════════════════════════════════════════
+
+def capture_loop():
+    """Core 2 — continuously acquire frames from picamera2."""
+    global latest_cam_frame
+    while True:
+        try:
+            frame = picam2.capture_array()
+            frame = cv2.flip(frame, -1)   # correct inverted camera mounting
+            with frame_lock:
+                latest_cam_frame = frame
+        except:
+            time.sleep(0.01)
+
+def processing_loop():
+    """
+    Core 1 — line following and motor control.
+    Uses Week 2 PD controller with pivot mode.
+    Priority: colour line > black line > spin recovery.
+    """
+    global latest_disp_frame
+    f_cnt, t_start, cur_fps = 0, time.time(), 0.0
+
+    while True:
+        with action_lock:
+            is_perm = action_state["permanent_stop"]
+            is_run  = action_state["running"]
+
+        with frame_lock:
+            frame = latest_cam_frame
+        if frame is None:
+            time.sleep(0.01); continue
+
+        h, w = frame.shape[:2]
+
+        # Permanent stop — motors off, hold state
+        if is_perm:
+            stop_motors()
+            time.sleep(0.1); continue
+
+        # Symbol action running — yield control to action thread
+        if is_run:
+            time.sleep(0.03); continue
+
+        # ── Line detection and steering ────────────────────────────────────
+        cx, line_type, mask = get_line_centroid(frame)
+        l_spd = r_spd = 0.0
+        status = "no_line"
+        error_px = 0
+
+        if cx is not None:
+            l_spd, r_spd = compute_steering(cx)
+            set_motors(l_spd, r_spd)
+            error_px = cx - TARGET_CENTER
+            status   = "following"
+        else:
+            # Recovery: spin in direction of last known error
+            spin = 0.6 * PIVOT_POWER if last_error > 0 else -0.6 * PIVOT_POWER
+            set_motors(-spin, spin)
+            status = "recovery"
+
+        # ── FPS counter ────────────────────────────────────────────────────
+        f_cnt += 1
+        if time.time() - t_start >= 1.0:
+            cur_fps = f_cnt / (time.time() - t_start)
+            f_cnt   = 0
+            t_start = time.time()
+
+        with state_lock:
+            robot_state.update({
+                "status":    status,
+                "error_px":  error_px,
+                "left_speed":  round(l_spd, 1),
+                "right_speed": round(r_spd, 1),
+                "fps":       round(cur_fps, 1),
+                "line_type": line_type,
+            })
+
+        # Debug display — draw centroid and centre line
+        disp = frame.copy()
+        cv2.line(disp, (w // 2, 0), (w // 2, h - 1), (255, 0, 0), 1)
+        if cx is not None:
+            cy_disp = int(LINE_ROI_Y + (h - LINE_ROI_Y) / 2)
+            cv2.circle(disp, (cx + 0, cy_disp), 10, (0, 0, 255), -1)
+            cv2.line(disp, (w // 2, cy_disp), (cx, cy_disp), (0, 255, 0), 2)
+
+        with frame_lock:
+            latest_disp_frame = disp
+
+def inference_loop():
+    """
+    Core 3 — ONNX symbol classification at ~10 Hz.
+    Requires STABLE_NEEDED consecutive detections before triggering FSM action.
+    ACTION_COOLDOWN_SEC prevents re-triggering on the same symbol.
+    """
+    while True:
+        with frame_lock:
+            f = latest_cam_frame
+        if f is None or _session is None:
+            time.sleep(0.05); continue
+
+        label, conf = _onnx_classify(f)
+
+        with symbol_lock:
+            symbol_state.update({"shape": label, "confidence": conf})
+
+        threshold = CONF_THRESHOLDS.get(label.lower(), CONF_THRESHOLD_DEFAULT)
+
+        if conf >= threshold:
+            stable_counts[label] = stable_counts.get(label, 0) + 1
+        else:
+            stable_counts[label] = 0
+
+        if stable_counts.get(label, 0) >= STABLE_NEEDED:
+            with action_lock:
+                busy = action_state["running"] or action_state["permanent_stop"]
+                if not busy and not _is_in_cooldown(label):
+                    if label.lower() not in ("thumb", "qrcode",
+                                             "buttonsign", "warningsign"):
+                        action_state["running"] = True
+                    stable_counts[label] = 0
+                    threading.Thread(target=execute_action,
+                                     args=(label,), daemon=True).start()
+
+        time.sleep(0.1)
+
+# ═══════════════════════════════════════════════════════════════
+#  Flask Web Dashboard
+# ═══════════════════════════════════════════════════════════════
+
+PORT = 5000
+app  = Flask(__name__)
+
+@app.route('/')
+def index():
+    return """<!DOCTYPE html><html><head><meta charset="UTF-8">
+    <title>Group E23 Robot</title>
+    <style>
+        body { margin:0; background:#111; color:#fff; font-family:monospace;
+               display:flex; flex-direction:column; align-items:center; padding:16px; }
+        img  { width:100%; max-width:640px; border-radius:8px; border:2px solid #333; }
+        #shape  { font-size:32px; font-weight:bold; color:#00d2ff; margin-top:12px; }
+        #conf   { font-size:18px; color:#aaa; }
+        #action { font-size:18px; color:#ff9f43; margin-top:6px; }
+        #status { font-size:14px; color:#aaa; margin-top:6px; }
+        #alert  { font-size:20px; color:#4cd137; margin-top:8px; opacity:0; transition:0.3s; }
+        .flash  { animation: blink 0.25s 6; }
+        @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.2} }
+    </style></head><body>
+    <img src="/video">
+    <div id="shape">—</div>
+    <div id="conf"></div>
+    <div id="action"></div>
+    <div id="status"></div>
+    <div id="alert"></div>
+    <script>
+        let prev_flash = false;
+        setInterval(async () => {
+            const s = await fetch('/api/symbol').then(r=>r.json());
+            document.getElementById('shape').textContent  = s.shape;
+            document.getElementById('conf').textContent   = s.confidence.toFixed(1)+'%';
+            document.getElementById('action').textContent = s.action !== 'none' ? s.action : '';
+            const al = document.getElementById('alert');
+            if(s.flash && !prev_flash){
+                al.textContent = s.shape + ' DETECTED!';
+                al.style.opacity = 1;
+                document.getElementById('shape').classList.add('flash');
+                setTimeout(()=>{ al.style.opacity=0;
+                    document.getElementById('shape').classList.remove('flash'); }, 3000);
+            }
+            prev_flash = s.flash;
+            const r = await fetch('/api/state').then(r=>r.json());
+            document.getElementById('status').textContent =
+                'FPS: '+r.fps+' | Line: '+r.line_type+' | Error: '+r.error_px+'px';
+        }, 300);
+    </script></body></html>"""
+
+@app.route('/video')
+def video():
+    def gen():
+        while True:
+            with frame_lock: f = latest_disp_frame
+            if f is not None:
+                _, buf = cv2.imencode('.jpg', f, [cv2.IMWRITE_JPEG_QUALITY, 60])
+                yield b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buf.tobytes() + b'\r\n'
+            time.sleep(0.04)
+    return Response(gen(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/api/symbol')
+def api_symbol():
+    with symbol_lock: return jsonify(dict(symbol_state))
+
+@app.route('/api/state')
+def api_state():
+    with state_lock: return jsonify(dict(robot_state))
+
+# ═══════════════════════════════════════════════════════════════
+#  CPU Affinity and Entry Point
+# ═══════════════════════════════════════════════════════════════
+
+def _set_affinity(mask):
+    try:
+        ctypes.CDLL('libc.so.6').sched_setaffinity(
+            0, ctypes.sizeof(ctypes.c_ulong),
+            ctypes.byref(ctypes.c_ulong(mask))
+        )
+    except:
+        pass
+
+def _spawn(target, mask, name):
+    def wrap(): _set_affinity(mask); target()
+    threading.Thread(target=wrap, name=name, daemon=True).start()
+
+if __name__ == '__main__':
+    print("Loading ONNX model...")
+    loaded = _load_onnx()
+    print(f"Model loaded: {loaded} | Labels: {_labels}")
+
+    # Assign each thread to a dedicated CPU core
+    _spawn(capture_loop,    0b0100, "cap")    # Core 2
+    _spawn(processing_loop, 0b0010, "line")   # Core 1
+    _spawn(inference_loop,  0b1000, "inf")    # Core 3
+    _set_affinity(0b0001)                     # Flask — Core 0
+
+    print(f"Robot starting on http://0.0.0.0:{PORT}")
+    try:
+        app.run(host='0.0.0.0', port=PORT, threaded=True, use_reloader=False)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_motors()
+        picam2.stop()
+        GPIO.cleanup()
+        print("Shutdown complete.")
